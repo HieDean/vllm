@@ -52,12 +52,10 @@ logger = logging.get_logger(__name__)
 class MyLlamaRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
-    def __init__(self, config: LlamaConfig, device=None):
+    def __init__(self, vllm_config: VllmConfig, prefix: str, device=None):
         super().__init__()
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
-
-        self.config = config
+        self.vllm_config = vllm_config
+        self.config = self.vllm_config.model_config.hf_config
 
         self.rope_type = self.config.rope_parameters["rope_type"]
         rope_init_fn: Callable = self.compute_default_rope_parameters
@@ -148,15 +146,15 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
 
 class MyLlamaMLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, vllm_config: VllmConfig, prefix: str):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.vllm_config = vllm_config
+        self.config = self.vllm_config.model_config.hf_config
+
+        self.gate_proj = nn.Linear(self.config.hidden_size, self.config.intermediate_size, bias=self.config.mlp_bias)
+        self.up_proj = nn.Linear(self.config.hidden_size, self.config.intermediate_size, bias=self.config.mlp_bias)
+        self.down_proj = nn.Linear(self.config.intermediate_size, self.config.hidden_size, bias=self.config.mlp_bias)
+        self.act_fn = ACT2FN[self.config.hidden_act]
 
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -204,27 +202,28 @@ def eager_attention_forward(
 class MyLlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+    def __init__(self, vllm_config: VllmConfig, prefix: str, layer_idx: int):
         super().__init__()
-        self.config = config
+        self.vllm_config = vllm_config
+        self.config = self.vllm_config.model_config.hf_config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
+        self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
-        self.attention_dropout = config.attention_dropout
+        self.attention_dropout = self.config.attention_dropout
         self.is_causal = True
 
         self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+            self.config.hidden_size, self.config.num_attention_heads * self.head_dim, bias=self.config.attention_bias
         )
         self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            self.config.hidden_size, self.config.num_key_value_heads * self.head_dim, bias=self.config.attention_bias
         )
         self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            self.config.hidden_size, self.config.num_key_value_heads * self.head_dim, bias=self.config.attention_bias
         )
         self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+            self.config.num_attention_heads * self.head_dim, self.config.hidden_size, bias=self.config.attention_bias
         )
 
     def forward(
@@ -269,15 +268,16 @@ class MyLlamaAttention(nn.Module):
 
 
 class MyLlamaDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+    def __init__(self, vllm_config: VllmConfig, prefix: str, layer_idx: int):
         super().__init__()
-        self.hidden_size = config.hidden_size
+        self.vllm_config = vllm_config
+        self.config = self.vllm_config.model_config.hf_config
 
-        self.self_attn = MyLlamaAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = MyLlamaAttention(self.vllm_config, f"{prefix}.self_attn", layer_idx=layer_idx)
 
-        self.mlp = MyLlamaMLP(config)
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = MyLlamaMLP(self.vllm_config, f"{prefix}.mlp")
+        self.input_layernorm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
 
     def forward(
         self,
@@ -329,7 +329,7 @@ class MyLlamaModel(nn.Module):
         self.norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
         # NOTE: this rotary_emb is used for position embedding,
         # it seems vllm have different impl.
-        # self.rotary_emb = MyLlamaRotaryEmbedding(config=self.config)
+        self.rotary_emb = MyLlamaRotaryEmbedding(self.vllm_config, f"{prefix}.rotary_emb")
 
 
     @merge_with_config_defaults
