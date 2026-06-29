@@ -17,7 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections.abc import Callable
-from typing import Optional
+from typing import Optional, Iterable
 
 import torch
 from torch import nn
@@ -42,7 +42,10 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.attention import Attention
+from vllm.v1.attention.backend import AttentionType
 from .utils import (
+    AutoWeightsLoader,
     maybe_prefix,
 )
 
@@ -99,12 +102,12 @@ class MyLlamaRotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
-        position_ids_expanded = position_ids[:, None, :].float()
+        inv_freq_expanded = self.inv_freq[:, None].float().expand(-1, 1).to(x.device)
+        position_ids_expanded = position_ids[None, :].float()
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
         with maybe_autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(0, 1)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
@@ -161,43 +164,6 @@ class MyLlamaMLP(nn.Module):
         return down_proj
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs: Unpack[TransformersKwargs],
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
-
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
-
-
 @use_kernelized_func(apply_rotary_pos_emb)
 class MyLlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -206,6 +172,7 @@ class MyLlamaAttention(nn.Module):
         super().__init__()
         self.vllm_config = vllm_config
         self.config = self.vllm_config.model_config.hf_config
+
         self.layer_idx = layer_idx
         self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
         self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
@@ -226,45 +193,39 @@ class MyLlamaAttention(nn.Module):
             self.config.num_attention_heads * self.head_dim, self.config.hidden_size, bias=self.config.attention_bias
         )
 
+        self.attn = Attention(
+            self.config.num_attention_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.config.num_key_value_heads,
+            cache_config=None,
+            quant_config=None,
+            per_layer_sliding_window=None,
+            attn_type=AttentionType.DECODER,
+            prefix=f"{prefix}.attn",
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        attention_mask: torch.Tensor | None = None,
-        past_key_values: Cache | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+        input_shape = hidden_states.shape
+        hidden_shape = (input_shape[0], -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states = self.q_proj(hidden_states).view(hidden_shape)
+        key_states = self.k_proj(hidden_states).view(hidden_shape)
+        value_states = self.v_proj(hidden_states).view(hidden_shape)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_values is not None:
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+        attn_output = self.attn(query_states, key_states, value_states)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = attn_output.reshape(input_shape[0], -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        return attn_output
 
 
 class MyLlamaDecoderLayer(GradientCheckpointingLayer):
@@ -281,25 +242,16 @@ class MyLlamaDecoderLayer(GradientCheckpointingLayer):
 
     def forward(
         self,
+        position_embeddings: torch.Tensor,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        use_cache: bool | None = False,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+
         # Self Attention
-        hidden_states, _ = self.self_attn(
+        hidden_states = self.self_attn(
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
             position_embeddings=position_embeddings,
-            **kwargs,
         )
         hidden_states = residual + hidden_states
 
@@ -312,16 +264,15 @@ class MyLlamaDecoderLayer(GradientCheckpointingLayer):
 
 
 class MyLlamaModel(nn.Module):
-    def __init__(self,
-                 vllm_config: VllmConfig,
-                 prefix: str = ""):
+    def __init__(self, vllm_config: VllmConfig, prefix: str):
         super().__init__()
         self.vllm_config = vllm_config
         self.config = self.vllm_config.model_config.hf_config
 
         self.embed_tokens = nn.Embedding(self.config.vocab_size,
                                          self.config.hidden_size,
-                                         self.config.padding_idx)
+                                         self.config.pad_token_id)
+
         self.layers = nn.ModuleList(
             [MyLlamaDecoderLayer(self.vllm_config, f"{prefix}.layers.{layer_idx}", layer_idx)
              for layer_idx in range(self.config.num_hidden_layers)]
@@ -331,137 +282,54 @@ class MyLlamaModel(nn.Module):
         # it seems vllm have different impl.
         self.rotary_emb = MyLlamaRotaryEmbedding(self.vllm_config, f"{prefix}.rotary_emb")
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
 
-    @merge_with_config_defaults
-    @capture_outputs
-    @auto_docstring
-    def forward(
-        self,
-        input_ids: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        use_cache: bool | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> BaseModelOutputWithPast:
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        if inputs_embeds is None:
-            inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
-
-        if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
-
-        if position_ids is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
-            position_ids = position_ids.unsqueeze(0)
-
-        causal_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
-
-        hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
+    def forward(self,
+                input_ids: torch.Tensor | None,
+                positions: torch.Tensor,
+                intermediate_tensors=None,
+                inputs_embeds=None):
+        hidden_states = self.embed_tokens(input_ids)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids=positions)
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
-                hidden_states,
-                attention_mask=causal_mask,
-                position_embeddings=position_embeddings,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                **kwargs,
-            )
+            hidden_states = decoder_layer(position_embeddings, hidden_states)
 
         hidden_states = self.norm(hidden_states)
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=past_key_values,
-        )
+        return hidden_states
 
 
 class MyLlamaForCausalLM(nn.Module):
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-    _tp_plan = {"lm_head": "colwise_gather_output"}
-    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
-
-    def __init__(self,
-                 vllm_config: VllmConfig,
-                 prefix: str = "",):
+    def __init__(self, vllm_config: VllmConfig, prefix: str):
         super().__init__()
         self.vllm_config = vllm_config
         self.config = self.vllm_config.model_config.hf_config
-        self.model = MyLlamaModel(
-            self.vllm_config,
-            # NOTE: why use `maybe_prefix`?
-            prefix=maybe_prefix(prefix, "model")
-        )
 
-        # NOTE: does lm_head need `maybe_prefix`?
+        self.model = MyLlamaModel(self.vllm_config, prefix=maybe_prefix(prefix, "model"))
+        # NOTE: why use maybe_prefix?
+        # NOTE: 哪些模块需要 vllmConfig 和 prefix, 哪些不需要, 为什么?
+        # NOTE: 哪些模块需要 embed_input_ids, 哪些不需要, 为什么?
+        # NOTE: 哪些模块需要 compute_logits, 哪些不需要, 为什么?
+
+        # NOTE: does lm_head need maybe_prefix?
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
-    @can_return_tuple
-    @auto_docstring
-    def forward(
-        self,
-        input_ids: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        labels: torch.LongTensor | None = None,
-        use_cache: bool | None = None,
-        logits_to_keep: int | torch.Tensor = 0,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> CausalLMOutputWithPast:
-        r"""
-        Example:
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
 
-        ```python
-        >>> from transformers import AutoTokenizer, MyLlamaForCausalLM
+    def forward(self, input_ids: torch.Tensor | None,
+                positions: torch.Tensor,
+                intermediate_tensors=None,
+                inputs_embeds=None):
+        return self.model(input_ids, positions)
+    
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return self.lm_head(hidden_states)
 
-        >>> model = MyLlamaForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
-        >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
-
-        >>> prompt = "Hey, are you conscious? Can you talk to me?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
-        ```"""
-        outputs: BaseModelOutputWithPast = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            **kwargs,
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-
-        hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+        return loader.load_weights(weights=weights)
