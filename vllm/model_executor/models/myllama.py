@@ -43,11 +43,17 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.v1.attention.backend import AttentionType
 from .utils import (
     AutoWeightsLoader,
     maybe_prefix,
 )
+
 
 logger = logging.get_logger(__name__)
 
@@ -301,19 +307,29 @@ class MyLlamaModel(nn.Module):
 
 
 class MyLlamaForCausalLM(nn.Module):
+    # NOTE: 哪些模块需要 vllmConfig 和 prefix, 哪些不需要, 为什么?
+    # xxxForCausalLM 和 xxxModel 是一定需要的;
+    # 在这两个之外, 其他子模块, 凡是用到了 vllm 自定义模块的, 都需要这两个入参 (因为 vllm 自定义模块就需要这两个入参);
+    # NOTE: 哪些模块需要 embed_input_ids, 哪些不需要, 为什么?
+    # xxxForCausalLM 和 xxxModel 都需要, 前者只需要调用后者的接口就可以;
+    # NOTE: 哪些模块需要 compute_logits, 哪些不需要, 为什么?
+    # 只有 xxxForCausalLM 需要;
     def __init__(self, vllm_config: VllmConfig, prefix: str):
         super().__init__()
         self.vllm_config = vllm_config
         self.config = self.vllm_config.model_config.hf_config
 
         self.model = MyLlamaModel(self.vllm_config, prefix=maybe_prefix(prefix, "model"))
-        # NOTE: why use maybe_prefix?
-        # NOTE: 哪些模块需要 vllmConfig 和 prefix, 哪些不需要, 为什么?
-        # NOTE: 哪些模块需要 embed_input_ids, 哪些不需要, 为什么?
-        # NOTE: 哪些模块需要 compute_logits, 哪些不需要, 为什么?
-
-        # NOTE: does lm_head need maybe_prefix?
-        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        self.lm_head = ParallelLMHead(
+            self.config.vocab_size,
+            self.config.hidden_size,
+            quant_config=self.vllm_config.quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
+        logit_scale = getattr(self.config, "logit_scale", 1.0)
+        self.logits_processor = LogitsProcessor(
+            self.config.vocab_size, scale=logit_scale
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -325,7 +341,7 @@ class MyLlamaForCausalLM(nn.Module):
         return self.model(input_ids, positions)
     
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        return self.lm_head(hidden_states)
+        return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
