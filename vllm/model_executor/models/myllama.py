@@ -22,37 +22,38 @@ from typing import Optional, Iterable
 import torch
 from torch import nn
 
-from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, DynamicCache
-from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub, use_kernelized_func
-from transformers.masking_utils import create_causal_mask
-from transformers.modeling_layers import GradientCheckpointingLayer
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
-)
+from transformers.integrations import use_kernel_func_from_hub, use_kernelized_func
+
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
-from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
-from transformers.utils.output_capturing import capture_outputs
+from transformers.utils import TransformersKwargs, logging
+from transformers.utils.generic import maybe_autocast
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from vllm.config import VllmConfig
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+)
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
 )
 from vllm.v1.attention.backend import AttentionType
 from .utils import (
     AutoWeightsLoader,
     maybe_prefix,
 )
+
 
 
 logger = logging.get_logger(__name__)
@@ -160,13 +161,36 @@ class MyLlamaMLP(nn.Module):
         self.vllm_config = vllm_config
         self.config = self.vllm_config.model_config.hf_config
 
-        self.gate_proj = nn.Linear(self.config.hidden_size, self.config.intermediate_size, bias=self.config.mlp_bias)
-        self.up_proj = nn.Linear(self.config.hidden_size, self.config.intermediate_size, bias=self.config.mlp_bias)
-        self.down_proj = nn.Linear(self.config.intermediate_size, self.config.hidden_size, bias=self.config.mlp_bias)
-        self.act_fn = ACT2FN[self.config.hidden_act]
+        self.gate_proj = ColumnParallelLinear(
+            input_size=self.config.hidden_size,
+            output_size=self.config.intermediate_size,
+            bias=self.config.mlp_bias,
+            quant_config=self.vllm_config.quant_config,
+            prefix=f"{prefix}.gate_proj"
+        )
+
+        self.up_proj = ColumnParallelLinear(
+            input_size=self.config.hidden_size,
+            output_size=self.config.intermediate_size,
+            bias=self.config.mlp_bias,
+            quant_config=self.vllm_config.quant_config,
+            prefix=f"{prefix}.up_proj"
+        )
+
+        self.act_fn = nn.functional.silu
+
+        self.down_proj = RowParallelLinear(
+            input_size=self.config.intermediate_size,
+            output_size=self.config.hidden_size,
+            bias=self.config.mlp_bias,
+            quant_config=self.vllm_config.quant_config,
+            prefix=f"{prefix}.down_proj"
+        )
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate_proj, _ = self.gate_proj(x)
+        up_proj, _ = self.up_proj(x)
+        down_proj, _ = self.down_proj(self.act_fn(gate_proj) * up_proj)
         return down_proj
 
 
@@ -178,34 +202,42 @@ class MyLlamaAttention(nn.Module):
         super().__init__()
         self.vllm_config = vllm_config
         self.config = self.vllm_config.model_config.hf_config
-
         self.layer_idx = layer_idx
-        self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
-        self.num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads
+        self.head_dim = getattr(self.config, "head_dim",
+                                self.config.hidden_size // self.config.num_attention_heads)
         self.scaling = self.head_dim**-0.5
-        self.attention_dropout = self.config.attention_dropout
-        self.is_causal = True
 
-        self.q_proj = nn.Linear(
-            self.config.hidden_size, self.config.num_attention_heads * self.head_dim, bias=self.config.attention_bias
+        tp_size = get_tensor_model_parallel_world_size()
+        self.num_heads = self.config.num_attention_heads // tp_size
+        self.num_kv_heads = max(1, self.config.num_key_value_heads // tp_size)
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=self.config.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=self.config.num_attention_heads,
+            total_num_kv_heads=self.config.num_key_value_heads,
+            bias=self.config.attention_bias,
+            quant_config=self.vllm_config.quant_config,
+            prefix=f"{prefix}.qkv_proj",
         )
-        self.k_proj = nn.Linear(
-            self.config.hidden_size, self.config.num_key_value_heads * self.head_dim, bias=self.config.attention_bias
-        )
-        self.v_proj = nn.Linear(
-            self.config.hidden_size, self.config.num_key_value_heads * self.head_dim, bias=self.config.attention_bias
-        )
-        self.o_proj = nn.Linear(
-            self.config.num_attention_heads * self.head_dim, self.config.hidden_size, bias=self.config.attention_bias
+
+        self.o_proj = RowParallelLinear(
+            input_size=self.config.num_attention_heads * self.head_dim,
+            output_size=self.config.hidden_size,
+            bias=self.config.attention_bias,
+            quant_config=self.vllm_config.quant_config,
+            prefix=f"{prefix}.o_proj",
         )
 
         self.attn = Attention(
-            self.config.num_attention_heads,
+            self.num_heads,
             self.head_dim,
             self.scaling,
-            num_kv_heads=self.config.num_key_value_heads,
-            cache_config=None,
-            quant_config=None,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=self.vllm_config.cache_config,
+            quant_config=self.vllm_config.quant_config,
             per_layer_sliding_window=None,
             attn_type=AttentionType.DECODER,
             prefix=f"{prefix}.attn",
@@ -220,21 +252,23 @@ class MyLlamaAttention(nn.Module):
         input_shape = hidden_states.shape
         hidden_shape = (input_shape[0], -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape)
-        key_states = self.k_proj(hidden_states).view(hidden_shape)
-        value_states = self.v_proj(hidden_states).view(hidden_shape)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        q, k = q.view(hidden_shape), k.view(hidden_shape)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        q = q.reshape(-1, self.q_size)
+        k = k.reshape(-1, self.kv_size)
 
-        attn_output = self.attn(query_states, key_states, value_states)
+        attn_output = self.attn(q, k, v)
 
         attn_output = attn_output.reshape(input_shape[0], -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+        attn_output, _ = self.o_proj(attn_output)
         return attn_output
 
 
-class MyLlamaDecoderLayer(GradientCheckpointingLayer):
+class MyLlamaDecoderLayer(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str, layer_idx: int):
         super().__init__()
         self.vllm_config = vllm_config
@@ -275,9 +309,11 @@ class MyLlamaModel(nn.Module):
         self.vllm_config = vllm_config
         self.config = self.vllm_config.model_config.hf_config
 
-        self.embed_tokens = nn.Embedding(self.config.vocab_size,
-                                         self.config.hidden_size,
-                                         self.config.pad_token_id)
+        self.embed_tokens = VocabParallelEmbedding(
+            self.config.vocab_size,
+            self.config.hidden_size,
+            quant_config=self.vllm_config.quant_config,
+        )
 
         self.layers = nn.ModuleList(
             [MyLlamaDecoderLayer(self.vllm_config, f"{prefix}.layers.{layer_idx}", layer_idx)
@@ -304,6 +340,41 @@ class MyLlamaModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            # (".gate_up_proj", ".gate_proj", 0),
+            # (".gate_up_proj", ".up_proj", 1),
+        ]
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+        for name, loaded_weight in weights:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
 
 
 class MyLlamaForCausalLM(nn.Module):
