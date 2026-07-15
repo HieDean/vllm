@@ -147,6 +147,13 @@ def kernel_unified_attention(
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2) if IS_3D else 0
 
+    """
+    seq_idx:                        seq_idx
+    q_block_local_idx:              q_block_local_idx
+    cur_batch_in_all_start_index:   index of cur seq start token 
+    cur_batch_query_len:            num query tokens of cur seq
+    seq_len:                        seq_len
+    """
     (
         seq_idx,
         q_block_local_idx,
@@ -658,6 +665,27 @@ def unified_attention(
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         tile_size = TILE_SIZE_DECODE
 
+    """
+    query:                          [num_tokens, num_heads, head_size]
+                                    [num_seq1_tokens + num_seq2_tokens + ..., num_heads, head_size]
+    key_cache:                      [num_blocks, block_size, num_kv_heads, head_size]
+    value_cache:                    [num_blocks, block_size, num_kv_heads, head_size]
+    key_cache 和 value_cache 是当前 attention layer 在本 GPU/TP rank 上的全局 KV cache 池
+    block_table:                    req/seq -> logical_block_idx -> physical_block_idx
+    seq_lens(seqused_k):            seq_len = context_len + query_len
+    query_start_len(cu_seqlens_q):  prefix sum of seq_len
+
+    BLOCK_M and BLOCK_Q
+    num_query_heads = num_queries_per_kv * num_kv_heads
+    one grid process one kv_heads,
+    but one kv_heads is shared by num_queries_per_kv query_heads,
+    and because BLOCK_M is static, we hope BLOCK_M * num_kv_heads = num_query_tokens * num_query_heads,
+    => BLOCK_M * num_kv_heads = num_query_tokens * num_queries_per_kv * num_kv_heads
+    => BLOCK_Q = num_query_tokens = BLOCK_M / num_queries_per_kv
+    so BLOCK_Q means one grid process BLOCK_Q query tokens,
+    and BLOCK_M means BLOCK_Q query tokens needs BLOCK_M query heads,
+    one grid process BLOCK_M query heads, BLOCK_M query heads is belong to BLOCK_Q different query tokens.
+    """
     kernel_unified_attention[grid](
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
